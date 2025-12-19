@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::debug;
 use tracing::{info, warn};
 
+
 // we give each grangers struct a unique
 // program identifier which is the order in
 // which it was created.
@@ -978,14 +979,12 @@ impl Grangers {
         warn_empty: bool,
     ) -> anyhow::Result<Grangers> {
         let column = self.get_column_name(by.as_ref(), false)?;
+        // Create a list Series for is_in
+        let values_vec: Vec<String> = values.iter().map(|s| s.as_ref().to_string()).collect();
+        let list_series = Series::new("values".into(), vec![Series::new("inner".into(), values_vec)])
+            .cast(&DataType::List(Box::new(DataType::String)))?;
         let s = self.df().column(&column)?.as_materialized_series();
-        let df = self.df().filter(&is_in(
-            s,
-            &Series::new(
-                PlSmallStr::from_str("values"),
-                values.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
-            ),
-        )?)?;
+        let df = self.df().filter(&is_in(s, &list_series, false)?)?;
 
         if df.is_empty() && warn_empty {
             warn!("The filtered dataframe is empty.")
@@ -1661,7 +1660,7 @@ impl Grangers {
     ) -> anyhow::Result<Grangers> {
         self.validate(false, true)?;
         let gene_id = self.get_column_name_str("gene_id", true)?;
-        self.boundary(gene_id, exon_feature, multithreaded)
+        self.boundary(gene_id, exon_feature, None, multithreaded)
     }
 
     /// Computes the boundary regions for transcripts from the exon annotations in the [Grangers] instance.
@@ -1685,10 +1684,11 @@ impl Grangers {
     pub fn transcripts(
         &self,
         exon_feature: Option<&str>,
+        extra_group_by_columns: Option<&[&str]>,
         multithreaded: bool,
     ) -> anyhow::Result<Grangers> {
         let transcript_id = self.get_column_name_str("transcript_id", true)?;
-        self.boundary(transcript_id, exon_feature, multithreaded)
+        self.boundary(transcript_id, exon_feature, extra_group_by_columns, multithreaded)
     }
 
     /// Computes the boundary regions of genomic features (like genes or transcripts) based on their exons.
@@ -1716,6 +1716,7 @@ impl Grangers {
         &self,
         by: &str,
         exon_feature: Option<&str>,
+        extra_group_by_columns: Option<&[&str]>,
         multithreaded: bool,
     ) -> anyhow::Result<Grangers> {
         self.validate(false, true)?;
@@ -1727,10 +1728,17 @@ impl Grangers {
         let strand = fc.strand();
         let by = self.get_column_name_str(by, true)?;
 
+        let mut group_by_columns = vec![seqname, by, strand];
+        if let Some(extra_group_by_columns) = extra_group_by_columns {
+            for c in extra_group_by_columns {
+                group_by_columns.push(self.get_column_name_str(c, true)?);
+            }
+        }
+
         // check if genes are well defined: all features of a gene should have a valid seqname, start, end, and strand
         let any_invalid = exon_gr
             .df()
-            .select([seqname, strand, by])?
+            .select(group_by_columns.clone())?
             .lazy()
             .group_by([by])
             .agg([
@@ -1755,7 +1763,7 @@ impl Grangers {
         exon_gr.df = exon_gr
             .df
             .lazy()
-            .group_by([seqname, by, strand])
+            .group_by(group_by_columns)
             .agg([col(start).min(), col(end).max()])
             .collect()?;
 
@@ -1825,11 +1833,11 @@ impl Grangers {
         }
 
         // make sure that strand is valid
-        if !is_in(
-            &exon_gr.column(strand)?.as_materialized_series().unique()?,
-            &Series::new("valid stands".into(), VALIDSTRANDS),
-        )?
-        .all()
+        let valid_strands_vec: Vec<String> = VALIDSTRANDS.iter().map(|s| s.to_string()).collect();
+        let list_series = Series::new("values".into(), vec![Series::new("inner".into(), valid_strands_vec)])
+            .cast(&DataType::List(Box::new(DataType::String)))?;
+        if !is_in(&exon_gr.column(strand)?.as_materialized_series().unique()?, &list_series, false)?
+            .all()
         {
             bail!("Found exons that do not have a valid strand (+ or -). Cannot proceed.")
         }
@@ -1958,11 +1966,13 @@ impl Grangers {
         // if contains null value in strand, we cannot do strand-specific extension
         if (!ignore_strand) & (extend_option != &ExtendOption::Both)
             && self.column(strand)?.is_null().any()
-                | !is_in(
-                    &self.column(strand)?.as_materialized_series().unique()?,
-                    &Series::new("valid stands".into(), VALIDSTRANDS),
-                )?
-                .all()
+                | {
+                    let valid_strands_vec: Vec<String> = VALIDSTRANDS.iter().map(|s| s.to_string()).collect();
+                    let list_series = Series::new("values".into(), vec![Series::new("inner".into(), valid_strands_vec)])
+                        .cast(&DataType::List(Box::new(DataType::String)))?;
+                    !is_in(&self.column(strand)?.as_materialized_series().unique()?, &list_series, false)?
+                        .all()
+                }
         {
             bail!("The strand column contains values other than {:?}. Please remove them first or set ignore_strand to true.", VALIDSTRANDS)
         }
@@ -2256,7 +2266,7 @@ impl Grangers {
                                     .with_multithreaded(multithreaded),
                             ),
                         )
-                        .add(Expr::Literal(LiteralValue::UInt32(offset)))
+                        .add(Expr::Literal(LiteralValue::Scalar(offset.into())))
                         .over(by)
                         .cast(DataType::String)
                         .alias(name),
@@ -2962,7 +2972,7 @@ impl Grangers {
         let mut reader = grangers_utils::get_noodles_reader_from_path(ref_path)?;
         // we also create a fasta writer
         let out_writer = BufWriter::with_capacity(4194304, out_file);
-        let mut writer = noodles::fasta::writer::Builder::default()
+        let mut writer = noodles::fasta::io::writer::Builder::default()
             .set_line_base_count(usize::MAX)
             .build_from_writer(out_writer);
 
@@ -3204,7 +3214,7 @@ impl Grangers {
 
         let mut reader = grangers_utils::get_noodles_reader_from_path(ref_path)?;
 
-        let mut writer = noodles::fasta::writer::Builder::default()
+        let mut writer = noodles::fasta::io::writer::Builder::default()
             .set_line_base_count(usize::MAX)
             .build_from_writer(out_file);
         let mut empty_counter = 0;
@@ -3404,7 +3414,7 @@ impl Grangers {
         let mut reader = grangers_utils::get_noodles_reader_from_path(ref_path)?;
 
         let out_writer = BufWriter::with_capacity(4194304, out_file);
-        let mut writer = noodles::fasta::writer::Builder::default()
+        let mut writer = noodles::fasta::io::writer::Builder::default()
             .set_line_base_count(usize::MAX)
             .build_from_writer(out_writer);
 
